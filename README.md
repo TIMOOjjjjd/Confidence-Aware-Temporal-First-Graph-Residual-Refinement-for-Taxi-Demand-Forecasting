@@ -4,10 +4,10 @@ Code accompanying the ICA3PP 2026 paper **Confidence-Aware Temporal-First Graph 
 
 ## Paper authors
 
-- Tianqi Wang
-- Ligang He (corresponding author)
+- Tianqi Wang ([tim.wang@warwick.ac.uk](mailto:tim.wang@warwick.ac.uk))
+- Ligang He ([ligang.he@warwick.ac.uk](mailto:ligang.he@warwick.ac.uk), corresponding author)
 
-The repository citation metadata is also provided in [`CITATION.cff`](CITATION.cff).
+The paper is available as [`main.pdf`](main.pdf). Repository citation metadata is provided in [`CITATION.cff`](CITATION.cff).
 
 ## Scope
 
@@ -109,6 +109,7 @@ The full experiments are CPU-intensive. Ex3 and Ex5 use residual-model seeds `11
 
 ## Repository contents
 
+- `main.pdf`: paper manuscript, including author affiliations and contact emails.
 - `code/`: paper experiment implementations and frozen per-zone TCN checkpoints.
 - `tests/`: deterministic regression tests that do not train the temporal model.
 - `docs/DATA.md`: dataset placement, schema, preprocessing, and redistribution boundary.
