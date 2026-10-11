@@ -1,0 +1,1353 @@
+"""Experiment 5-from-TCN: compare graph structures from cached TCN predictions.
+
+This experiment reuses cached no-graph TCN predictions as the temporal baseline.
+GraphSAGE variants and capacity-matched residual controls share node features:
+
+    base_pred, full_confidence, mean_24h, mean_168h, mean_720h
+
+History features follow the shared feature transformation. Confidence can be
+excluded explicitly. The loss is uniform; comparisons with residual_mlp and
+node_sage, not the temporal baseline alone, assess neighbor aggregation benefits.
+"""
+
+from __future__ import annotations
+
+import argparse
+from revision_protocol import (
+    add_revision_args, start_revision_run, freeze_cohort,
+    annotate_predictions, finish_revision_run,
+)
+from collections import Counter
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+
+from build_od_graph import (
+    _build_matrix,
+    _build_random_matrix,
+    _load_location_lookup,
+    _load_zone_names,
+    _retain_top_k,
+)
+from experiment_3_confidence_weighted_gnn_ablation import (
+    BASE_DIR,
+    DEFAULT_DATA_PATH,
+    DEFAULT_LOOKUP_PATH,
+    DEFAULT_RESULTS_DIR,
+    EXCLUDED_ZONES,
+    ROLLING_STEPS,
+    START_TARGET,
+    GNNTrainingConfig,
+    GraphContext,
+    SplitMasks,
+    build_graph_context,
+    build_zone_hourly_counts,
+    compute_prior_scores_from_zone_hourly_counts,
+    evaluate_refined_predictions,
+    resolve_window_starts,
+    run_single_ablation,
+    set_random_seed,
+    validate_windows,
+)
+from experiment_2_from_tcn import (
+    DEFAULT_PEAK_HOURS,
+    DEFAULT_TCN_DETAIL,
+    build_step_df_from_tcn,
+    load_no_graph_tcn_baseline,
+)
+from tcn_feature_utils import (
+    add_peak_shrinkage_args, validate_peak_shrinkage_args,
+    apply_peak_residual_shrinkage,
+    build_gnn_features_with_history,
+    build_historical_gnn_training_data_with_history,
+)
+from rolling_od_graph_utils import aggregate_available_od
+
+
+GRAPH_CONFIDENCE_MODE = "none"
+DEFAULT_OD_EDGE_MATRIX = BASE_DIR / "edge_weight_matrix_od.csv"
+DEFAULT_GEO_EDGE_MATRIX = BASE_DIR / "edge_weight_matrix_geo.csv"
+DEFAULT_OUTPUT_DIR = (
+    DEFAULT_RESULTS_DIR
+    / "revision_20260917" / "ex5"
+)
+DEFAULT_MORNING_PEAK_HOURS = DEFAULT_PEAK_HOURS
+DEFAULT_RANDOM_SEEDS = [1, 2, 3, 4, 5]
+DEFAULT_OD_LOOKBACK_DAY_LIST = [7, 14, 30, 60]
+
+
+@dataclass(frozen=True)
+class GraphSpec:
+    key: str
+    model_name: str
+    description: str
+    edge_csv: Optional[Path]
+    random_seed: Optional[int] = None
+    od_lookback_days: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class LocationSplitSets:
+    train: Set[int]
+    val: Set[int]
+    test: Set[int]
+
+
+def add_residual_training_split_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--residual-training-split",
+        choices=["all", "peak_non_peak"],
+        default="peak_non_peak",
+        help=(
+            "Historical residual snapshots used for each GNN. 'peak_non_peak' "
+            "trains peak target hours only on prior peak snapshots and non-peak "
+            "target hours only on prior non-peak snapshots."
+        ),
+    )
+
+
+def history_frame_is_peak(frame: pd.DataFrame, peak_hours: Set[int]) -> bool:
+    if frame.empty or "target_hour" not in frame.columns:
+        return False
+    hours = pd.to_datetime(frame["target_hour"]).dt.hour.dropna().unique()
+    return bool(len(hours) > 0 and int(hours[0]) in peak_hours)
+
+
+def filter_history_frames_before(
+    history_frames: Sequence[pd.DataFrame],
+    target_hour: pd.Timestamp,
+) -> List[pd.DataFrame]:
+    filtered: List[pd.DataFrame] = []
+    target_ts = pd.Timestamp(target_hour)
+    for frame in history_frames:
+        if frame.empty:
+            continue
+        if "target_hour" not in frame.columns:
+            filtered.append(frame)
+            continue
+        frame_hours = pd.to_datetime(frame["target_hour"])
+        if frame_hours.max() < target_ts:
+            filtered.append(frame)
+    return filtered
+
+
+def select_residual_training_history(
+    history_frames: Sequence[pd.DataFrame],
+    target_hour: pd.Timestamp,
+    peak_hours: Set[int],
+    split_mode: str,
+) -> Tuple[List[pd.DataFrame], Dict[str, object]]:
+    prior_frames = filter_history_frames_before(history_frames, target_hour)
+    peak_frames = [frame for frame in prior_frames if history_frame_is_peak(frame, peak_hours)]
+    non_peak_frames = [
+        frame for frame in prior_frames if not history_frame_is_peak(frame, peak_hours)
+    ]
+
+    target_is_peak = int(pd.Timestamp(target_hour).hour) in peak_hours
+    if split_mode == "peak_non_peak":
+        selected_frames = peak_frames if target_is_peak else non_peak_frames
+        partition = "peak" if target_is_peak else "non_peak"
+    elif split_mode == "all":
+        selected_frames = prior_frames
+        partition = "all"
+    else:
+        raise ValueError(f"Unsupported residual training split: {split_mode}")
+
+    diagnostics = {
+        "residual_training_split": split_mode,
+        "target_period": "peak" if target_is_peak else "non_peak",
+        "training_history_partition": partition,
+        "history_snapshots": len(selected_frames),
+        "all_history_snapshots": len(prior_frames),
+        "peak_history_snapshots": len(peak_frames),
+        "non_peak_history_snapshots": len(non_peak_frames),
+    }
+    return selected_frames, diagnostics
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run Experiment 5 graph-structure comparison from cached no-graph "
+            "TCN predictions with confidence/history node features."
+        )
+    )
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA_PATH)
+    parser.add_argument("--lookup", type=Path, default=DEFAULT_LOOKUP_PATH)
+    parser.add_argument(
+        "--od-edge-csv",
+        type=Path,
+        default=DEFAULT_OD_EDGE_MATRIX,
+        help="Static OD graph CSV used only when --od-lookback-days is 0.",
+    )
+    parser.add_argument("--geo-edge-csv", type=Path, default=DEFAULT_GEO_EDGE_MATRIX)
+    parser.add_argument(
+        "--tcn-detail",
+        "--ex5-detail",
+        dest="tcn_detail",
+        type=Path,
+        default=DEFAULT_TCN_DETAIL,
+        help="Detailed CSV containing cached no_graph TCN predictions.",
+    )
+    parser.add_argument(
+        "--prediction-column",
+        choices=["refined_pred", "base_pred"],
+        default="base_pred",
+        help="Prediction column to reuse from the cached TCN detail CSV.",
+    )
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--start-target", type=pd.Timestamp, default=START_TARGET)
+    parser.add_argument(
+        "--window-starts",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional explicit 24-hour window starts. By default, uses the "
+            "same twelve windows as demo_test.py. If omitted with a custom "
+            "--start-target, a single window is run for backward compatibility."
+        ),
+    )
+    parser.add_argument("--rolling-steps", type=int, default=ROLLING_STEPS)
+    parser.add_argument("--excluded-zones", type=int, nargs="*", default=EXCLUDED_ZONES)
+    parser.add_argument(
+        "--peak-hours",
+        "--morning-peak-hours",
+        dest="peak_hours",
+        type=int,
+        nargs="*",
+        default=DEFAULT_MORNING_PEAK_HOURS,
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-ratio", type=float, default=0.6)
+    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--gnn-epochs", type=int, default=300)
+    parser.add_argument("--gnn-hidden-dim", type=int, default=256)
+    parser.add_argument("--gnn-dropout", type=float, default=0.1)
+    parser.add_argument("--gnn-lr", type=float, default=0.01)
+    parser.add_argument("--gnn-patience", type=int, default=40)
+    parser.add_argument(
+        "--use-edge-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use nonzero CSV values as weighted GraphSAGE aggregation weights. "
+            "Enabled by default to match Experiment 2; pass --no-use-edge-weight "
+            "to compare topology only."
+        ),
+    )
+    add_residual_training_split_arg(parser)
+    add_peak_shrinkage_args(parser)
+    parser.set_defaults(peak_shrinkage_alpha=1.0)
+    parser.add_argument("--od-availability", choices=["completed", "pickup"],
+                        default="completed")
+    parser.add_argument(
+        "--graph-types",
+        nargs="*",
+        choices=["no_graph", "residual_mlp", "node_sage", "od", "geo", "random"],
+        default=["no_graph", "residual_mlp", "node_sage", "geo", "od"],
+        help="Subset and order of graph variants to evaluate.",
+    )
+    parser.add_argument(
+        "--od-lookback-days",
+        type=int,
+        default=None,
+        help=(
+            "Compatibility shortcut for a single OD window. If provided, it "
+            "overrides --od-lookback-days-list. Use 0 to load static --od-edge-csv."
+        ),
+    )
+    parser.add_argument(
+        "--od-lookback-days-list",
+        type=int,
+        nargs="*",
+        default=DEFAULT_OD_LOOKBACK_DAY_LIST,
+        help=(
+            "OD graph windows to compare. Each N builds an OD graph from trips in "
+            "[target_hour - N days, target_hour). Use 0 to include static --od-edge-csv."
+        ),
+    )
+    parser.add_argument(
+        "--od-graph-dir",
+        type=Path,
+        default=None,
+        help="Directory for generated rolling OD graph CSVs. Defaults to results/od_graphs.",
+    )
+    parser.add_argument(
+        "--od-top-k",
+        type=int,
+        default=10,
+        help="Keep the top K destination zones per origin when generating rolling OD graphs.",
+    )
+    parser.add_argument(
+        "--od-min-flow",
+        type=int,
+        default=1,
+        help="Drop rolling OD edges with fewer than this many trips before top-k filtering.",
+    )
+    parser.add_argument(
+        "--od-weight-mode",
+        choices=["row_share", "retained_share", "count", "binary", "log_count"],
+        default="row_share",
+        help="How to write retained rolling OD edge weights.",
+    )
+    parser.add_argument(
+        "--od-symmetrize",
+        choices=["none", "max", "sum", "mean"],
+        default="none",
+        help="Optionally convert each rolling OD graph to an undirected matrix.",
+    )
+    parser.add_argument(
+        "--od-include-self",
+        action="store_true",
+        help="Keep trips where pickup and dropoff map to the same zone in rolling OD graphs.",
+    )
+    parser.add_argument(
+        "--random-seeds",
+        type=int,
+        nargs="*",
+        default=DEFAULT_RANDOM_SEEDS,
+        help="Fixed seeds used to generate random graph baselines.",
+    )
+    parser.add_argument(
+        "--random-mode",
+        choices=["edge_count", "per_origin_top_k"],
+        default="per_origin_top_k",
+        help="Random graph construction mode reused from build_od_graph.py.",
+    )
+    parser.add_argument(
+        "--random-top-k",
+        type=int,
+        default=10,
+        help="Random outgoing destinations per node, or edge-count fallback multiplier.",
+    )
+    parser.add_argument(
+        "--random-edge-count",
+        type=int,
+        default=None,
+        help="Total random edges for --random-mode edge_count.",
+    )
+    parser.add_argument(
+        "--random-weight-mode",
+        choices=["binary", "uniform"],
+        default="binary",
+        help="Random edge weights. GNN currently uses nonzero topology, not edge weights.",
+    )
+    parser.add_argument(
+        "--random-graph-dir",
+        type=Path,
+        default=None,
+        help="Directory for generated random graph CSVs. Defaults to results/random_graphs.",
+    )
+    parser.add_argument(
+        "--max-zones",
+        type=int,
+        default=None,
+        help="Optional smoke-test limit. Default evaluates all shared compatible zones.",
+    )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Skip writing experiment_5_from_tcn_metrics.png.",
+    )
+    add_revision_args(parser)
+    args = parser.parse_args()
+    validate_peak_shrinkage_args(parser, args)
+    if not args.tcn_detail.exists():
+        parser.error(f"--tcn-detail does not exist: {args.tcn_detail}")
+    if not args.graph_types:
+        parser.error("--graph-types requires at least one graph type when provided.")
+    if args.od_lookback_days is not None:
+        if args.od_lookback_days < 0:
+            parser.error("--od-lookback-days must be >= 0.")
+        args.od_lookback_days_list = [args.od_lookback_days]
+    if "od" in args.graph_types and not args.od_lookback_days_list:
+        parser.error("--od-lookback-days-list requires at least one value when od is selected.")
+    invalid_od_days = [days for days in args.od_lookback_days_list if days < 0]
+    if invalid_od_days:
+        parser.error(f"Invalid OD lookback day(s): {invalid_od_days}")
+    if args.od_top_k < 0:
+        parser.error("--od-top-k must be >= 0.")
+    if args.od_min_flow < 1:
+        parser.error("--od-min-flow must be >= 1.")
+    if not args.peak_hours:
+        parser.error("--peak-hours must contain at least one hour.")
+    invalid_peak_hours = [hour for hour in args.peak_hours if hour < 0 or hour > 23]
+    if invalid_peak_hours:
+        parser.error(f"Invalid peak hour(s): {invalid_peak_hours}")
+    if "random" in args.graph_types and not args.random_seeds:
+        parser.error("--random-seeds requires at least one seed when random is selected.")
+    if args.random_top_k < 0:
+        parser.error("--random-top-k must be >= 0.")
+    if args.random_edge_count is not None and args.random_edge_count < 0:
+        parser.error("--random-edge-count must be >= 0.")
+    return args
+
+
+def build_graph_specs(args: argparse.Namespace) -> Tuple[Dict[str, GraphSpec], List[str]]:
+    random_graph_dir = (
+        args.random_graph_dir
+        if args.random_graph_dir is not None
+        else args.results_dir / "random_graphs"
+    )
+    base_specs = {
+        "residual_mlp": GraphSpec(
+            key="residual_mlp", model_name="Feature-matched Residual MLP",
+            description="Node-wise residual MLP; no neighbour aggregation",
+            edge_csv=args.geo_edge_csv,
+        ),
+        "node_sage": GraphSpec(
+            key="node_sage", model_name="GraphSAGE without cross-node edges",
+            description="Same GraphSAGE architecture with all cross-node edges removed",
+            edge_csv=args.geo_edge_csv,
+        ),
+        "no_graph": GraphSpec(
+            key="no_graph",
+            model_name="No Graph Temporal",
+            description="temporal baseline only; no residual GraphSAGE",
+            edge_csv=None,
+        ),
+        "geo": GraphSpec(
+            key="geo",
+            model_name="Geographic Graph",
+            description="Unweighted residual GraphSAGE on geographic graph",
+            edge_csv=args.geo_edge_csv,
+        ),
+    }
+    specs: Dict[str, GraphSpec] = {}
+    graph_order: List[str] = []
+    for graph_type in dict.fromkeys(args.graph_types):
+        if graph_type == "od":
+            for days in dict.fromkeys(int(value) for value in args.od_lookback_days_list):
+                key = "od_static" if days == 0 else f"od_{days}d"
+                specs[key] = GraphSpec(
+                    key=key,
+                    model_name="OD Graph" if days == 0 else f"OD Graph ({days}d)",
+                    description=(
+                        "Unweighted residual GraphSAGE on a static OD-flow graph"
+                        if days == 0
+                        else f"Unweighted residual GraphSAGE on rolling {days}-day OD-flow graphs"
+                    ),
+                    edge_csv=args.od_edge_csv if days == 0 else None,
+                    od_lookback_days=days,
+                )
+                graph_order.append(key)
+            continue
+
+        if graph_type != "random":
+            specs[graph_type] = base_specs[graph_type]
+            graph_order.append(graph_type)
+            continue
+
+        for seed in args.random_seeds:
+            key = f"random_seed_{int(seed)}"
+            specs[key] = GraphSpec(
+                key=key,
+                model_name=f"Random Graph seed={int(seed)}",
+                description=(
+                    "Unweighted residual GraphSAGE on a generated random graph, "
+                    f"seed={int(seed)}"
+                ),
+                edge_csv=random_graph_dir / f"edge_weight_matrix_random_seed_{int(seed)}.csv",
+                random_seed=int(seed),
+            )
+            graph_order.append(key)
+    return specs, graph_order
+
+
+def generate_random_graphs(
+    args: argparse.Namespace,
+    specs: Dict[str, GraphSpec],
+    graph_order: Sequence[str],
+) -> None:
+    random_specs = [specs[key] for key in graph_order if specs[key].random_seed is not None]
+    if not random_specs:
+        return
+
+    zone_names = _load_zone_names(args.lookup, template_path=None)
+    for spec in random_specs:
+        if spec.edge_csv is None or spec.random_seed is None:
+            continue
+        spec.edge_csv.parent.mkdir(parents=True, exist_ok=True)
+        matrix = _build_random_matrix(
+            zone_names=zone_names,
+            random_mode=args.random_mode,
+            random_edge_count=args.random_edge_count,
+            top_k=args.random_top_k,
+            include_self=False,
+            random_seed=spec.random_seed,
+            random_weight_mode=args.random_weight_mode,
+            symmetrize="none",
+            reference=None,
+        )
+        matrix.to_csv(spec.edge_csv, encoding="utf-8")
+        edge_count = int((matrix.to_numpy(dtype=float) > 0.0).sum())
+        print(
+            f"Generated {spec.key} at {spec.edge_csv} "
+            f"with {edge_count} nonzero edges."
+        )
+
+
+def rolling_od_graph_keys(
+    specs: Dict[str, GraphSpec],
+    graph_order: Sequence[str],
+) -> List[str]:
+    return [
+        graph_key
+        for graph_key in graph_order
+        if (specs[graph_key].od_lookback_days or 0) > 0
+    ]
+
+
+def od_graph_dir(args: argparse.Namespace) -> Path:
+    return args.od_graph_dir if args.od_graph_dir is not None else args.results_dir / "od_graphs"
+
+
+def od_graph_path(
+    args: argparse.Namespace,
+    target_hour: pd.Timestamp,
+    lookback_days: int,
+) -> Path:
+    timestamp = pd.Timestamp(target_hour).strftime("%Y%m%d_%H%M%S")
+    return od_graph_dir(args) / (
+        f"edge_weight_matrix_od_last_{lookback_days}d_until_{timestamp}.csv"
+    )
+
+
+def load_od_zone_names(args: argparse.Namespace) -> List[str]:
+    template_path = args.geo_edge_csv if args.geo_edge_csv.exists() else None
+    return _load_zone_names(args.lookup, template_path=template_path)
+
+
+def aggregate_od_flows_from_frame(
+    frame: pd.DataFrame,
+    location_to_zone: Dict[int, str],
+    excluded_locations: Set[int],
+    include_self: bool,
+) -> Tuple[Counter[Tuple[str, str]], Counter[str], int]:
+    from rolling_od_graph_utils import aggregate_od_flows_from_frame as aggregate
+
+    return aggregate(frame, location_to_zone, excluded_locations, include_self)
+
+
+def build_rolling_od_graph_context(
+    args: argparse.Namespace,
+    df: pd.DataFrame,
+    lookup_df: pd.DataFrame,
+    zone_names: List[str],
+    location_to_zone: Dict[int, str],
+    target_hour: pd.Timestamp,
+    lookback_days: int,
+) -> GraphContext:
+    if "DOLocationID" not in df.columns and "od_events_path" not in df.attrs:
+        raise ValueError("Rolling OD graph generation requires DOLocationID in taxi data.")
+
+    end_time = pd.Timestamp(target_hour)
+    start_time = end_time - pd.Timedelta(days=lookback_days)
+    flows, origin_totals, kept_rows = aggregate_available_od(
+        args, df, end_time, lookback_days, location_to_zone
+    )
+    retained = _retain_top_k(
+        flows=flows,
+        top_k=args.od_top_k,
+        min_flow=args.od_min_flow,
+    )
+    matrix = _build_matrix(
+        zone_names=zone_names,
+        retained=retained,
+        origin_totals=origin_totals,
+        weight_mode=args.od_weight_mode,
+        symmetrize=args.od_symmetrize,
+    )
+
+    output_path = od_graph_path(
+        args=args,
+        target_hour=end_time,
+        lookback_days=lookback_days,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix.to_csv(output_path, encoding="utf-8")
+
+    edge_count = int((matrix.to_numpy(dtype=float) > 0.0).sum())
+    print(
+        "Generated rolling OD graph "
+        f"[{start_time}, {end_time}) at {output_path} "
+        f"from {kept_rows} retained trips with {edge_count} nonzero edges."
+    )
+    return build_graph_context(edge_csv=output_path, lookup_df=lookup_df)
+
+
+def load_taxi_data(
+    data_path: Path,
+    excluded_zones: Sequence[int],
+    include_dropoff: bool,
+) -> pd.DataFrame:
+    from prepare_revision_data import load_cached_trip_data
+
+    df = load_cached_trip_data(data_path, include_dropoff)
+    df["pickup_datetime"] = pd.to_datetime(df["pickup_datetime"])
+    df["datetime"] = df["pickup_datetime"].dt.floor("h")
+    df = df[~df["PULocationID"].isin(excluded_zones)].copy()
+
+    print("Earliest timestamp:", df["datetime"].min())
+    print("Latest timestamp:", df["datetime"].max())
+    print("Total hours:", df["datetime"].nunique())
+    print("Total non-excluded zones:", df["PULocationID"].nunique())
+    return df
+
+
+def load_graph_contexts(
+    specs: Dict[str, GraphSpec],
+    requested_graphs: Sequence[str],
+    lookup_df: pd.DataFrame,
+    skip_graphs: Optional[Set[str]] = None,
+) -> Dict[str, GraphContext]:
+    skip_graphs = skip_graphs or set()
+    graphs: Dict[str, GraphContext] = {}
+    for graph_key in requested_graphs:
+        if graph_key in skip_graphs:
+            continue
+        spec = specs[graph_key]
+        if spec.edge_csv is None:
+            continue
+        if not spec.edge_csv.exists():
+            raise FileNotFoundError(
+                f"Missing {graph_key} graph matrix: {spec.edge_csv}. "
+                "Generate it first or pass the corresponding --*-edge-csv path."
+            )
+        graph = build_graph_context(edge_csv=spec.edge_csv, lookup_df=lookup_df)
+        graphs[graph_key] = graph
+        print(
+            f"Loaded {graph_key} graph from {spec.edge_csv} "
+            f"with {len(graph.zone_names)} zones and {graph.edge_index.shape[1]} edges."
+        )
+    return graphs
+
+
+def compatible_zones_for_graph(df: pd.DataFrame, graph: GraphContext) -> Set[int]:
+    zones: Set[int] = set()
+    for zone_id in df["PULocationID"].dropna().unique():
+        zone_int = int(zone_id)
+        zone_name = graph.location_to_zone.get(zone_int)
+        if (zone_name is not None and zone_name in graph.zone_idx_map
+                and graph.zone_to_location.get(zone_name) == zone_int):
+            zones.add(zone_int)
+    return zones
+
+
+def select_shared_zones(
+    df: pd.DataFrame,
+    graphs: Dict[str, GraphContext],
+    max_zones: Optional[int],
+) -> List[int]:
+    shared = set(int(zone_id) for zone_id in df["PULocationID"].dropna().unique())
+    for graph_key, graph in graphs.items():
+        graph_zones = compatible_zones_for_graph(df, graph)
+        shared &= graph_zones
+        print(f"{graph_key} graph-compatible zones:", len(graph_zones))
+
+    zones = sorted(shared)
+    if max_zones is not None:
+        zones = zones[: max(1, max_zones)]
+        print(f"Using first {len(zones)} shared zones for smoke-test run.")
+    if len(zones) < 3:
+        raise ValueError("At least three shared valid zones are required for this experiment.")
+    print("Shared zones selected:", len(zones))
+    return zones
+
+
+def finite_step_zone_ids(step_df: pd.DataFrame, candidate_zones: Sequence[int]) -> List[int]:
+    candidate_set = set(int(zone_id) for zone_id in candidate_zones)
+    mask = (
+        step_df["PULocationID"].isin(candidate_set)
+        & np.isfinite(step_df["base_pred"].to_numpy(dtype=float))
+        & np.isfinite(step_df["true_value"].to_numpy(dtype=float))
+    )
+    zone_ids = sorted(int(zone_id) for zone_id in step_df.loc[mask, "PULocationID"])
+    if len(zone_ids) < 3:
+        raise ValueError("At least three finite baseline predictions are required.")
+    return zone_ids
+
+
+def make_location_split_sets(
+    location_ids: Sequence[int],
+    seed: int,
+    train_ratio: float,
+    val_ratio: float,
+) -> LocationSplitSets:
+    if train_ratio <= 0.0 or val_ratio < 0.0 or train_ratio + val_ratio >= 1.0:
+        raise ValueError("Require train_ratio > 0, val_ratio >= 0, and train + val < 1.")
+
+    unique_ids = np.array(sorted(set(int(loc_id) for loc_id in location_ids)), dtype=int)
+    if unique_ids.size < 3:
+        raise ValueError("At least three locations are required for train/val/test splits.")
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(unique_ids)
+    train_count = max(1, int(round(unique_ids.size * train_ratio)))
+    val_count = max(1, int(round(unique_ids.size * val_ratio)))
+    if train_count + val_count >= unique_ids.size:
+        val_count = max(1, unique_ids.size - train_count - 1)
+    test_count = unique_ids.size - train_count - val_count
+    if test_count <= 0:
+        train_count = max(1, unique_ids.size - val_count - 1)
+        test_count = unique_ids.size - train_count - val_count
+    if test_count <= 0:
+        raise ValueError("Unable to create a non-empty test split.")
+
+    return LocationSplitSets(
+        train=set(int(loc_id) for loc_id in perm[:train_count]),
+        val=set(int(loc_id) for loc_id in perm[train_count : train_count + val_count]),
+        test=set(int(loc_id) for loc_id in perm[train_count + val_count :]),
+    )
+
+
+def masks_from_location_splits(
+    data,
+    split_sets: LocationSplitSets,
+    require_train_val: bool = True,
+    require_test: bool = False,
+) -> SplitMasks:
+    location_ids = data.location_id.cpu().numpy().astype(int)
+    train = torch.tensor([loc_id in split_sets.train for loc_id in location_ids])
+    val = torch.tensor([loc_id in split_sets.val for loc_id in location_ids])
+    test = torch.tensor([loc_id in split_sets.test for loc_id in location_ids])
+    if require_train_val and (int(train.sum()) == 0 or int(val.sum()) == 0):
+        raise ValueError("Graph data does not contain non-empty train/val splits.")
+    if require_test and int(test.sum()) == 0:
+        raise ValueError("Graph data does not contain a non-empty test split.")
+    return SplitMasks(train=train, val=val, test=test)
+
+
+def split_label_for_location(location_id: int, split_sets: LocationSplitSets) -> str:
+    if location_id in split_sets.train:
+        return "train"
+    if location_id in split_sets.val:
+        return "val"
+    if location_id in split_sets.test:
+        return "test"
+    return "unused"
+
+
+def collect_no_graph_predictions(
+    target_hour: pd.Timestamp,
+    step_df: pd.DataFrame,
+    split_sets: LocationSplitSets,
+    spec: GraphSpec,
+) -> pd.DataFrame:
+    rows = step_df.copy()
+    rows = rows[
+        np.isfinite(rows["base_pred"].to_numpy(dtype=float))
+        & np.isfinite(rows["true_value"].to_numpy(dtype=float))
+    ].copy()
+    rows["split"] = rows["PULocationID"].map(
+        lambda zone_id: split_label_for_location(int(zone_id), split_sets)
+    )
+    rows = rows[rows["split"] != "unused"].copy()
+    rows["is_test"] = rows["split"] == "test"
+    rows["graph_type"] = spec.key
+    rows["mode"] = spec.key
+    rows["experiment_3_mode"] = "none"
+    rows["Model"] = spec.model_name
+    rows["random_seed"] = np.nan
+    rows["edge_weight_used"] = False
+    rows["residual_target"] = rows["true_value"] - rows["base_pred"]
+    rows["residual_pred"] = 0.0
+    rows["refined_pred"] = rows["base_pred"]
+    rows["sample_weight"] = np.nan
+    rows["best_epoch"] = 0
+    rows["best_val_loss"] = np.nan
+    rows["target_hour"] = target_hour
+    return rows[
+        [
+            "target_hour",
+            "graph_type",
+            "mode",
+            "experiment_3_mode",
+            "Model",
+            "random_seed",
+            "edge_weight_used",
+            "PULocationID",
+            "split",
+            "is_test",
+            "base_pred",
+            "true_value",
+            "residual_target",
+            "residual_pred",
+            "refined_pred",
+            "sample_weight",
+            "prior_score",
+            "stability_score",
+            "history_consistency_score",
+            "full_confidence",
+            "best_epoch",
+            "best_val_loss",
+        ]
+    ]
+
+
+def hourly_record_from_predictions(
+    target_hour: pd.Timestamp,
+    predictions: pd.DataFrame,
+    spec: GraphSpec,
+) -> Dict[str, object]:
+    test_df = predictions[predictions["is_test"]]
+    metrics = evaluate_refined_predictions(
+        y_true=test_df["true_value"].to_numpy(dtype=float),
+        y_pred=test_df["refined_pred"].to_numpy(dtype=float),
+    )
+    return {
+        "target_hour": target_hour,
+        "graph_type": spec.key,
+        "mode": spec.key,
+        "experiment_3_mode": predictions["experiment_3_mode"].iloc[0],
+        "Model": spec.model_name,
+        "random_seed": spec.random_seed,
+        "edge_weight_used": False,
+        "hourly_mae": metrics["MAE"],
+        "hourly_rmse": metrics["RMSE"],
+        "hourly_mse": metrics["MSE"],
+        "n_train": int((predictions["split"] == "train").sum()),
+        "n_val": int((predictions["split"] == "val").sum()),
+        "n_test": int((predictions["split"] == "test").sum()),
+        "best_epoch": int(predictions["best_epoch"].max()),
+        "best_val_loss": float(predictions["best_val_loss"].max(skipna=True)),
+    }
+
+
+def run_graph_variant(
+    target_hour: pd.Timestamp,
+    graph_key: str,
+    graph: GraphContext,
+    step_df: pd.DataFrame,
+    history_frames: Sequence[pd.DataFrame],
+    split_sets: LocationSplitSets,
+    device: torch.device,
+    cfg: GNNTrainingConfig,
+    seed: int,
+    spec: GraphSpec,
+    use_edge_weight: bool,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    if graph_key in {"residual_mlp", "node_sage"}:
+        cfg = replace(cfg, model_type="mlp" if graph_key == "residual_mlp" else "node_sage")
+    inference_data = build_gnn_features_with_history(
+        step_df=step_df,
+        graph=graph,
+        use_edge_weight=use_edge_weight,
+    )
+    inference_splits = masks_from_location_splits(
+        data=inference_data,
+        split_sets=split_sets,
+        require_train_val=False,
+        require_test=True,
+    )
+    train_data = build_historical_gnn_training_data_with_history(
+        history_frames=history_frames,
+        graph=graph,
+        use_edge_weight=use_edge_weight,
+    )
+    train_splits: Optional[SplitMasks] = None
+    if train_data is not None:
+        try:
+            train_splits = masks_from_location_splits(
+                data=train_data,
+                split_sets=split_sets,
+                require_train_val=True,
+                require_test=False,
+            )
+        except ValueError as exc:
+            print(f"[{target_hour}] {graph_key} historical GNN training skipped: {exc}")
+            train_data = None
+
+    prediction_df, hourly_record = run_single_ablation(
+        target_hour=target_hour,
+        mode=GRAPH_CONFIDENCE_MODE,
+        train_data=train_data,
+        train_splits=train_splits,
+        inference_data=inference_data,
+        inference_splits=inference_splits,
+        device=device,
+        cfg=cfg,
+        seed=seed,
+    )
+
+    prediction_df["graph_type"] = graph_key
+    prediction_df["mode"] = graph_key
+    prediction_df["experiment_3_mode"] = GRAPH_CONFIDENCE_MODE
+    prediction_df["Model"] = spec.model_name
+    prediction_df["random_seed"] = spec.random_seed
+    prediction_df["edge_weight_used"] = bool(use_edge_weight)
+
+    hourly_record["graph_type"] = graph_key
+    hourly_record["mode"] = graph_key
+    hourly_record["experiment_3_mode"] = GRAPH_CONFIDENCE_MODE
+    hourly_record["Model"] = spec.model_name
+    hourly_record["random_seed"] = spec.random_seed
+    hourly_record["edge_weight_used"] = bool(use_edge_weight)
+    return prediction_df, hourly_record
+
+
+def summarize_results(
+    detailed_df: pd.DataFrame,
+    hourly_df: pd.DataFrame,
+    specs: Dict[str, GraphSpec],
+    graph_order: Sequence[str],
+) -> pd.DataFrame:
+    no_graph_mae = np.nan
+    if "no_graph" in set(graph_order):
+        no_graph_df = detailed_df[
+            (detailed_df["graph_type"] == "no_graph") & detailed_df["is_test"]
+        ]
+        no_graph_metrics = evaluate_refined_predictions(
+            y_true=no_graph_df["true_value"].to_numpy(dtype=float),
+            y_pred=no_graph_df["refined_pred"].to_numpy(dtype=float),
+        )
+        no_graph_mae = no_graph_metrics["MAE"]
+
+    rows: List[Dict[str, object]] = []
+    for graph_key in graph_order:
+        spec = specs[graph_key]
+        test_df = detailed_df[
+            (detailed_df["graph_type"] == graph_key) & detailed_df["is_test"]
+        ]
+        metrics = evaluate_refined_predictions(
+            y_true=test_df["true_value"].to_numpy(dtype=float),
+            y_pred=test_df["refined_pred"].to_numpy(dtype=float),
+        )
+        hourly_values = hourly_df.loc[
+            hourly_df["graph_type"] == graph_key,
+            "hourly_mae",
+        ].dropna()
+        mae_delta = metrics["MAE"] - no_graph_mae
+        if np.isfinite(no_graph_mae) and not np.isclose(no_graph_mae, 0.0):
+            mae_improvement_pct = (no_graph_mae - metrics["MAE"]) / no_graph_mae * 100.0
+        else:
+            mae_improvement_pct = np.nan
+
+        rows.append(
+            {
+                "graph_type": graph_key,
+                "Model": spec.model_name,
+                "Description": spec.description,
+                "random_seed": spec.random_seed,
+                "MAE": metrics["MAE"],
+                "RMSE": metrics["RMSE"],
+                "MSE": metrics["MSE"],
+                "Std of hourly MAE": (
+                    float(np.std(hourly_values.to_numpy(dtype=float), ddof=0))
+                    if not hourly_values.empty
+                    else np.nan
+                ),
+                "Random seed MAE std": np.nan,
+                "MAE delta vs no_graph": mae_delta,
+                "MAE improvement vs no_graph (%)": mae_improvement_pct,
+            }
+        )
+    summary_df = pd.DataFrame(rows)
+    random_df = summary_df[summary_df["random_seed"].notna()]
+    if len(random_df) > 1:
+        mean_mae = float(random_df["MAE"].mean())
+        mean_rmse = float(random_df["RMSE"].mean())
+        mean_mse = float(random_df["MSE"].mean())
+        if np.isfinite(no_graph_mae) and not np.isclose(no_graph_mae, 0.0):
+            improvement_pct = (no_graph_mae - mean_mae) / no_graph_mae * 100.0
+        else:
+            improvement_pct = np.nan
+        summary_df = pd.concat(
+            [
+                summary_df,
+                pd.DataFrame(
+                    [
+                        {
+                            "graph_type": "random_mean",
+                            "Model": "Random Graph mean over seeds",
+                            "Description": "Mean over generated random graph seeds",
+                            "random_seed": np.nan,
+                            "MAE": mean_mae,
+                            "RMSE": mean_rmse,
+                            "MSE": mean_mse,
+                            "Std of hourly MAE": float(random_df["Std of hourly MAE"].mean()),
+                            "Random seed MAE std": float(random_df["MAE"].std(ddof=0)),
+                            "MAE delta vs no_graph": mean_mae - no_graph_mae,
+                            "MAE improvement vs no_graph (%)": improvement_pct,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+    return summary_df
+
+
+def run_experiment(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    start_revision_run(args, __file__)
+    set_random_seed(args.seed)
+    peak_hours = set(int(hour) for hour in args.peak_hours)
+    baseline_cache = load_no_graph_tcn_baseline(
+        detail_path=args.tcn_detail,
+        prediction_column=args.prediction_column,
+    )
+
+    specs, requested_graphs = build_graph_specs(args)
+    rolling_od_keys = rolling_od_graph_keys(specs=specs, graph_order=requested_graphs)
+    rolling_od = bool(rolling_od_keys)
+    generate_random_graphs(args=args, specs=specs, graph_order=requested_graphs)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("CUDA available:", torch.cuda.is_available())
+    print("Using device:", device)
+    print("TCN detail:", args.tcn_detail)
+    print("Prediction column:", args.prediction_column)
+    print("Node features: base_pred + full_confidence + mean_24h/168h/720h")
+    print("GNN loss weighting mode:", GRAPH_CONFIDENCE_MODE)
+    print("Graph variants:", ", ".join(requested_graphs))
+    print("Use graph edge weights:", bool(args.use_edge_weight))
+    print("Peak hours:", sorted(peak_hours))
+    print("Residual training split:", args.residual_training_split)
+    if rolling_od:
+        print(
+            "Rolling OD graph windows:",
+            ", ".join(str(specs[key].od_lookback_days) for key in rolling_od_keys),
+        )
+
+    df = load_taxi_data(
+        data_path=args.data,
+        excluded_zones=args.excluded_zones,
+        include_dropoff=rolling_od,
+    )
+    window_starts = resolve_window_starts(args)
+    validate_windows(df, window_starts, args.rolling_steps)
+    print(
+        "Window starts:",
+        ", ".join(str(start) for start in window_starts),
+    )
+    lookup_df = pd.read_csv(args.lookup).drop_duplicates(subset="LocationID")
+    graphs = load_graph_contexts(
+        specs=specs,
+        requested_graphs=requested_graphs,
+        lookup_df=lookup_df,
+        skip_graphs=set(rolling_od_keys),
+    )
+    rolling_od_cache: Dict[Tuple[str, pd.Timestamp], GraphContext] = {}
+    od_zone_names: List[str] = []
+    od_location_to_zone: Dict[int, str] = {}
+    if rolling_od:
+        od_zone_names = load_od_zone_names(args)
+        od_location_to_zone = _load_location_lookup(args.lookup)
+        first_target_hour = window_starts[0]
+        for graph_key in rolling_od_keys:
+            lookback_days = int(specs[graph_key].od_lookback_days or 0)
+            cache_key = (graph_key, first_target_hour)
+            rolling_od_cache[cache_key] = build_rolling_od_graph_context(
+                args=args,
+                df=df,
+                lookup_df=lookup_df,
+                zone_names=od_zone_names,
+                location_to_zone=od_location_to_zone,
+                target_hour=first_target_hour,
+                lookback_days=lookback_days,
+            )
+            graphs[graph_key] = rolling_od_cache[cache_key]
+    zones = select_shared_zones(df=df, graphs=graphs, max_zones=args.max_zones)
+    zones = freeze_cohort(args, zones, baseline_cache, window_starts)
+    zone_hourly_counts = build_zone_hourly_counts(df)
+
+    gnn_cfg = GNNTrainingConfig(
+        hidden_dim=args.gnn_hidden_dim,
+        dropout=args.gnn_dropout,
+        learning_rate=args.gnn_lr,
+        epochs=args.gnn_epochs,
+        patience=args.gnn_patience,
+        model_type=args.residual_model,
+        use_confidence_feature=not args.exclude_confidence_feature,
+    )
+
+    detailed_frames: List[pd.DataFrame] = []
+    hourly_records: List[Dict[str, object]] = []
+
+    for window_idx, window_start in enumerate(window_starts, start=1):
+        # Keep GNN residual-training snapshots local to this evaluation window.
+        historical_step_frames: List[pd.DataFrame] = []
+        print(
+            f"\n===== Experiment 5-from-TCN window {window_idx}/{len(window_starts)} "
+            f"start={window_start} ====="
+        )
+        for step in range(args.rolling_steps):
+            global_step = (window_idx - 1) * args.rolling_steps + step
+            target_hour = window_start + pd.Timedelta(hours=step)
+            print(
+                f"\n///// Experiment 5-from-TCN target hour: {target_hour} "
+                f"window {window_idx} step {step} /////"
+            )
+
+            set_random_seed(args.seed)
+            if rolling_od:
+                for graph_key in rolling_od_keys:
+                    cache_key = (graph_key, target_hour)
+                    if cache_key not in rolling_od_cache:
+                        lookback_days = int(specs[graph_key].od_lookback_days or 0)
+                        print(
+                            f"[{target_hour}] start rolling OD graph {graph_key}",
+                            flush=True,
+                        )
+                        rolling_od_cache[cache_key] = build_rolling_od_graph_context(
+                            args=args,
+                            df=df,
+                            lookup_df=lookup_df,
+                            zone_names=od_zone_names,
+                            location_to_zone=od_location_to_zone,
+                            target_hour=target_hour,
+                            lookback_days=lookback_days,
+                        )
+                        print(
+                            f"[{target_hour}] done rolling OD graph {graph_key}",
+                            flush=True,
+                        )
+                    graphs[graph_key] = rolling_od_cache[cache_key]
+
+            print(f"[{target_hour}] start feature and split prep", flush=True)
+            prior_scores = compute_prior_scores_from_zone_hourly_counts(
+                zone_hourly_counts=zone_hourly_counts,
+                target_hour=target_hour,
+            )
+            step_df = build_step_df_from_tcn(
+                baseline_cache=baseline_cache,
+                target_hour=target_hour,
+                zones=zones,
+                zone_hourly_counts=zone_hourly_counts,
+                prior_scores=prior_scores,
+            )
+            step_df["window_id"] = window_idx
+            step_df["window_start"] = window_start
+            step_df["window_step"] = step
+            valid_locations = finite_step_zone_ids(step_df=step_df, candidate_zones=zones)
+            split_sets = make_location_split_sets(
+                location_ids=zones,
+                seed=args.split_seed,
+                train_ratio=args.train_ratio,
+                val_ratio=args.val_ratio,
+            )
+            history_frames, history_diag = select_residual_training_history(
+                history_frames=historical_step_frames,
+                target_hour=target_hour,
+                peak_hours=peak_hours,
+                split_mode=args.residual_training_split,
+            )
+            print(
+                f"[{target_hour}] done feature and split prep; "
+                f"history_snapshots={history_diag['history_snapshots']} "
+                f"partition={history_diag['training_history_partition']} "
+                f"all={history_diag['all_history_snapshots']} "
+                f"peak={history_diag['peak_history_snapshots']} "
+                f"non_peak={history_diag['non_peak_history_snapshots']}",
+                flush=True,
+            )
+
+            hour_messages: List[str] = []
+            for graph_key in requested_graphs:
+                print(f"[{target_hour}] start graph variant {graph_key}", flush=True)
+                spec = specs[graph_key]
+                if graph_key == "no_graph":
+                    prediction_df = collect_no_graph_predictions(
+                        target_hour=target_hour,
+                        step_df=step_df,
+                        split_sets=split_sets,
+                        spec=spec,
+                    )
+                    hourly_record = hourly_record_from_predictions(
+                        target_hour=target_hour,
+                        predictions=prediction_df,
+                        spec=spec,
+                    )
+                else:
+                    prediction_df, hourly_record = run_graph_variant(
+                        target_hour=target_hour,
+                        graph_key=graph_key,
+                        graph=graphs[graph_key],
+                        step_df=step_df,
+                        history_frames=history_frames,
+                        split_sets=split_sets,
+                        device=device,
+                        cfg=gnn_cfg,
+                        seed=args.seed,
+                        spec=spec,
+                        use_edge_weight=args.use_edge_weight,
+                    )
+
+                prediction_df, shrinkage_alpha = apply_peak_residual_shrinkage(
+                    prediction_df, target_hour, args.shrinkage_hours,
+                    args.peak_shrinkage_alpha,
+                )
+                metrics = evaluate_refined_predictions(
+                    prediction_df.loc[prediction_df["is_test"], "true_value"].to_numpy(),
+                    prediction_df.loc[prediction_df["is_test"], "refined_pred"].to_numpy(),
+                )
+                hourly_record.update(hourly_mae=metrics["MAE"], hourly_rmse=metrics["RMSE"],
+                                     hourly_mse=metrics["MSE"], shrinkage_alpha=shrinkage_alpha)
+                prediction_df["shrinkage_alpha"] = shrinkage_alpha
+                prediction_df["window_id"] = window_idx
+                prediction_df["window_start"] = window_start
+                prediction_df["window_step"] = step
+                prediction_df["od_lookback_days"] = spec.od_lookback_days
+                for column, value in history_diag.items():
+                    prediction_df[column] = value
+                hourly_record.update(
+                    {
+                        "window_id": window_idx,
+                        "window_start": window_start,
+                        "window_step": step,
+                        "od_lookback_days": spec.od_lookback_days,
+                        **history_diag,
+                    }
+                )
+                annotated = annotate_predictions(prediction_df, args)
+                if graph_key in {"residual_mlp", "node_sage"}:
+                    annotated["residual_model"] = "mlp" if graph_key == "residual_mlp" else "node_sage"
+                    annotated["edge_weight_used"] = False
+                    hourly_record["edge_weight_used"] = False
+                detailed_frames.append(annotated)
+                hourly_records.append(hourly_record)
+                hour_messages.append(f"{graph_key} MAE={hourly_record['hourly_mae']:.4f}")
+                print(
+                    f"[{target_hour}] done graph variant {graph_key} "
+                    f"MAE={hourly_record['hourly_mae']:.4f}",
+                    flush=True,
+                )
+
+            print(f"[{target_hour}] " + ", ".join(hour_messages), flush=True)
+            historical_step_frames.append(step_df.copy())
+
+    detailed_df = pd.concat(detailed_frames, ignore_index=True)
+    hourly_df = pd.DataFrame(hourly_records)
+    summary_df = summarize_results(
+        detailed_df=detailed_df,
+        hourly_df=hourly_df,
+        specs=specs,
+        graph_order=requested_graphs,
+    )
+    return summary_df, detailed_df, hourly_df
+
+
+def save_results(
+    summary_df: pd.DataFrame,
+    detailed_df: pd.DataFrame,
+    hourly_df: pd.DataFrame,
+    results_dir: Path,
+    make_plot: bool,
+) -> None:
+    results_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = results_dir / "experiment_5_from_tcn_summary.csv"
+    detailed_path = results_dir / "experiment_5_from_tcn_detailed.csv"
+    hourly_path = results_dir / "experiment_5_from_tcn_hourly_mae.csv"
+    plot_path = results_dir / "experiment_5_from_tcn_metrics.png"
+
+    summary_df.to_csv(summary_path, index=False)
+    detailed_df.to_csv(detailed_path, index=False)
+    hourly_df.to_csv(hourly_path, index=False)
+
+    plot_written = False
+    if make_plot:
+        try:
+            plot_metrics(
+                summary_df=summary_df,
+                hourly_df=hourly_df,
+                plot_path=plot_path,
+            )
+            plot_written = True
+        except ModuleNotFoundError as exc:
+            print(f"Plot skipped because optional dependency is missing: {exc}")
+
+    print(f"\nSaved summary to {summary_path}")
+    print(f"Saved detailed predictions to {detailed_path}")
+    print(f"Saved hourly MAE to {hourly_path}")
+    if plot_written:
+        print(f"Saved plot to {plot_path}")
+
+
+def plot_metrics(summary_df: pd.DataFrame, hourly_df: pd.DataFrame, plot_path: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    labels = summary_df["Model"].tolist()
+    x = np.arange(len(labels))
+    width = 0.25
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    axes[0].bar(x - width, summary_df["MAE"], width, label="MAE")
+    axes[0].bar(x, summary_df["RMSE"], width, label="RMSE")
+    axes[0].bar(x + width, summary_df["MSE"], width, label="MSE")
+    axes[0].set_title("Overall Error")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels, rotation=18, ha="right")
+    axes[0].grid(axis="y", linestyle="--", alpha=0.4)
+    axes[0].legend()
+
+    axes[1].bar(labels, summary_df["Std of hourly MAE"])
+    axes[1].set_title("Std of Hourly MAE")
+    axes[1].tick_params(axis="x", rotation=18)
+    axes[1].grid(axis="y", linestyle="--", alpha=0.4)
+
+    for graph_key in summary_df["graph_type"].tolist():
+        graph_hourly = hourly_df[hourly_df["graph_type"] == graph_key].sort_values(
+            "target_hour"
+        )
+        if graph_hourly.empty:
+            continue
+        model_name = summary_df.loc[summary_df["graph_type"] == graph_key, "Model"].iloc[0]
+        axes[2].plot(
+            pd.to_datetime(graph_hourly["target_hour"]),
+            graph_hourly["hourly_mae"],
+            marker="o",
+            linewidth=1.5,
+            label=model_name,
+        )
+    axes[2].set_title("Hourly MAE Over Rolling Hours")
+    axes[2].tick_params(axis="x", rotation=30)
+    axes[2].grid(axis="y", linestyle="--", alpha=0.4)
+    axes[2].legend(fontsize=8)
+
+    fig.suptitle("Experiment 5-from-TCN: Graph Structure Comparison")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=200)
+    plt.close(fig)
+
+
+def print_summary_table(summary_df: pd.DataFrame) -> None:
+    columns = [
+        "Model",
+        "MAE",
+        "RMSE",
+        "MSE",
+        "Std of hourly MAE",
+        "Random seed MAE std",
+        "MAE improvement vs no_graph (%)",
+    ]
+    display_df = summary_df[columns].copy()
+    for column in columns[1:]:
+        display_df[column] = display_df[column].map(
+            lambda value: f"{value:.4f}" if np.isfinite(value) else "nan"
+        )
+    print("\nFinal Summary Table")
+    print(display_df.to_string(index=False))
+
+
+def main() -> None:
+    args = parse_args()
+    summary_df, detailed_df, hourly_df = run_experiment(args)
+    save_results(
+        summary_df=summary_df,
+        detailed_df=detailed_df,
+        hourly_df=hourly_df,
+        results_dir=args.results_dir,
+        make_plot=not args.no_plot,
+    )
+    finish_revision_run(args)
+    print_summary_table(summary_df)
+
+
+if __name__ == "__main__":
+    main()

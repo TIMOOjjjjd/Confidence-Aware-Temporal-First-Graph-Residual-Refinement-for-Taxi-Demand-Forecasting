@@ -1,0 +1,23 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+.DS_Store
+
+# Downloaded source data and derived trip-level data
+*.parquet
+code/data.parquet
+prepared_data/
+artifacts/prepared_data/
+
+# Generated experiment artifacts
+outputs/
+results/
+artifacts/tcn_cache/
+*.log
+
+# Local plotting and notebook state
+.ipynb_checkpoints/

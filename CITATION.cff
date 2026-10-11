@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated ICA3PP 2026 paper."
+title: "Confidence-Aware Temporal-First Graph Residual Refinement for Taxi Demand Forecasting"
+type: software
+authors:
+  - given-names: Tianqi
+    family-names: Wang
+  - given-names: Ligang
+    family-names: He
+repository-code: "https://github.com/TIMOOjjjjd/Confidence-Aware-Temporal-First-Graph-Residual-Refinement-for-Taxi-Demand-Forecasting"
+version: 1.0.0
+date-released: 2026-10-11

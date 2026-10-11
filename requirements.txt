@@ -1,0 +1,11 @@
+numpy==2.4.6
+pandas==3.0.3
+pyarrow==25.0.0
+scipy==1.17.1
+scikit-learn==1.7.2
+matplotlib==3.11.1
+torch==2.13.0
+torch-geometric==2.8.0
+statsmodels==0.14.6
+psutil==7.2.2
+pytest==9.1.1
